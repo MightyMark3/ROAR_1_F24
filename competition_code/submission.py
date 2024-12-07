@@ -17,14 +17,13 @@ import atexit
 
 # from scipy.interpolate import interp1d
 
-useDebug = True
+useDebug = False
 useDebugPrinting = False
 debugData = {}
 
 
 def dist_to_waypoint(location, waypoint: roar_py_interface.RoarPyWaypoint):
     return np.linalg.norm(location[:2] - waypoint.location[:2])
-
 
 def filter_waypoints(
     location: np.ndarray,
@@ -34,7 +33,15 @@ def filter_waypoints(
     for i in range(current_idx, len(waypoints) + current_idx):
         if dist_to_waypoint(location, waypoints[i % len(waypoints)]) < 3:
             return i % len(waypoints)
-    return current_idx
+    min_dist = 1000
+    min_ind = current_idx
+    for i in range(0, 20):
+        ind = (current_idx + i) % len(waypoints)
+        d = dist_to_waypoint(location, waypoints[ind])
+        if d < min_dist:
+            min_dist = d
+            min_ind = ind
+    return min_ind
 
 
 def findClosestIndex(location, waypoints: List[roar_py_interface.RoarPyWaypoint]):
@@ -81,12 +88,14 @@ class RoarCompetitionSolution:
         self.occupancy_map_sensor = occupancy_map_sensor
         self.collision_sensor = collision_sensor
         self.lat_controller = LatController()
-        self.throttle_controller = ThrottleController()
+        self.throttle_controller = ThrottleController([])
         self.section_indeces = []
         self.num_ticks = 0
         self.section_start_ticks = 0
         self.current_section = 0
         self.lapNum = 1
+        self.lap_start_ticks = 0
+        self.section_speed_list = []
 
     async def initialize(self) -> None:
         # NOTE waypoints are changed through this line
@@ -95,6 +104,7 @@ class RoarCompetitionSolution:
                 np.load(f"{os.path.dirname(__file__)}\\waypoints\\waypointsPrimary.npz")
             )[50:]
         )
+        self.throttle_controller = ThrottleController(self.maneuverable_waypoints)
 
         sectionLocations = [
             [-278, 372],
@@ -104,7 +114,7 @@ class RoarCompetitionSolution:
             [198, 307],
             [-12, 38],
             [-85, -339],
-            [-150, -1042],
+            [-292, -1022],
             [-318, -991],
             [-352, -119],
         ]
@@ -128,6 +138,19 @@ class RoarCompetitionSolution:
             vehicle_location, self.current_waypoint_idx, self.maneuverable_waypoints
         )
 
+    def print_section_stats(self, section_num):
+        min_speed = min(self.section_speed_list)
+        max_speed = max(self.section_speed_list)
+        avg_speed = np.mean(self.section_speed_list)
+        print(f"Section {section_num}: {self.num_ticks - self.section_start_ticks:>3} ticks" +
+              f"  speed {min_speed:>4.1f} {avg_speed:>4.1f} {max_speed:>4.1f} exit {self.section_speed_list[-1]:>4.1f}")
+
+    def reset_section_stats(self):
+        self.section_speed_list = []
+
+    def update_section_stats(self, current_speed):
+        self.section_speed_list.append(current_speed)
+
     async def step(self) -> None:
         """
         This function is called every world step.
@@ -147,6 +170,7 @@ class RoarCompetitionSolution:
         self.current_waypoint_idx = filter_waypoints(
             vehicle_location, self.current_waypoint_idx, self.maneuverable_waypoints
         )
+        self.update_section_stats(current_speed_kmh)
 
         # compute and print section timing
         for i, section_ind in enumerate(self.section_indeces):
@@ -154,48 +178,65 @@ class RoarCompetitionSolution:
                 abs(self.current_waypoint_idx - section_ind) <= 2
                 and i != self.current_section
             ):
-                print(f"Section {i}: {self.num_ticks - self.section_start_ticks} ticks")
+                self.print_section_stats(self.current_section)
+                self.reset_section_stats()
                 self.section_start_ticks = self.num_ticks
                 self.current_section = i
-                if self.current_section == 0 and self.lapNum != 3:
+                if self.current_section == 0:
+                    if self.lapNum > 0:
+                        tick_delta = self.num_ticks - self.lap_start_ticks
+                        print(f"Lap {self.lapNum}: {tick_delta} ticks {tick_delta/20:.2f} sec")
+                    self.lap_start_ticks = self.num_ticks
                     self.lapNum += 1
-                    print(f"\nLap {self.lapNum}\n")
+                    if self.lapNum < 4:
+                        print(f"\nLap {self.lapNum}\n")
 
         nextWaypointIndex = self.get_lookahead_index(current_speed_kmh)
         waypoint_to_follow = self.next_waypoint_smooth(current_speed_kmh)
+
+        # # Custom controller to control the vehicle's speed
+        # waypoints_for_throttle = (self.maneuverable_waypoints * 2)[
+        #     nextWaypointIndex : nextWaypointIndex + 300
+        # ]
+        throttle, brake, gear = self.throttle_controller.run(
+            vehicle_location,
+            current_speed_kmh,
+            self.current_section,
+            self.current_waypoint_idx,
+            nextWaypointIndex
+        )
 
         # Pure pursuit controller to steer the vehicle
         steer_control = self.lat_controller.run(
             vehicle_location, vehicle_rotation, waypoint_to_follow
         )
-
-        # Custom controller to control the vehicle's speed
-        waypoints_for_throttle = (self.maneuverable_waypoints * 2)[
-            nextWaypointIndex : nextWaypointIndex + 300
-        ]
-        throttle, brake, gear = self.throttle_controller.run(
-            waypoints_for_throttle,
-            vehicle_location,
-            current_speed_kmh,
-            self.current_section,
-        )
-
         steerMultiplier = round((current_speed_kmh + 0.001) / 120, 3)
 
         if self.current_section in [3]:
             steerMultiplier *= 0.9
         if self.current_section == 4:
-            steerMultiplier = min(1.4, steerMultiplier * 1.6)
+            steerMultiplier = min(1.4, steerMultiplier * 1.75)
+            # steerMultiplier = min(1.4, steerMultiplier * 1.65)
+            # steerMultiplier = min(1.4, steerMultiplier * 1.6) # old
         if self.current_section in [6]:
             steerMultiplier = min(steerMultiplier * 5, 5.35)
         if self.current_section == 7:
             steerMultiplier *= 2
         if self.current_section == 9:
-            steerMultiplier = max(steerMultiplier, 1.6)
+            steerMultiplier = max(steerMultiplier, 1.7)
+            # steerMultiplier = max(steerMultiplier, 1.6) # old value
+
+        if self.current_section in []:
+            waypoints_for_steer = (self.maneuverable_waypoints * 2)[
+              self.current_waypoint_idx : self.current_waypoint_idx + 200
+            ]
+            steer_control = self.lat_pid_controller.run(vehicle_location, vehicle_rotation, current_speed_kmh, self.current_section, waypoint_to_follow, self.current_waypoint_idx, nextWaypointIndex, waypoints_for_steer)
+        else:
+            steer_control = steer_control * steerMultiplier
 
         control = {
             "throttle": np.clip(throttle, 0, 1),
-            "steer": np.clip(steer_control * steerMultiplier, -1, 1),
+            "steer": np.clip(steer_control, -1, 1),
             "brake": np.clip(brake, 0, 1),
             "hand_brake": 0,
             "reverse": 0,
@@ -245,16 +286,6 @@ Steer: {control['steer']:.10f} \n"
             250: 30,
             300: 35,
         }
-
-        # Interpolation method
-        # NOTE does not work as well as the dictionary lookahead method, likely to cause crashes.
-
-        # speedBoundList = [0, 90, 110, 130, 160, 180, 200, 250, 300]
-        # lookaheadList = [5, 11, 13, 15, 18, 22, 25, 28, 32]
-
-        # interpolationFunction = interp1d(speedBoundList, lookaheadList)
-        # return int(interpolationFunction(speed))
-
         for speed_upper_bound, num_points in speed_to_lookahead_dict.items():
             if speed < speed_upper_bound:
                 return num_points
@@ -265,23 +296,9 @@ Steer: {control['steer']:.10f} \n"
         Adds the lookahead waypoint to the current waypoint and normalizes it so that the value does not go out of bounds
         """
         num_waypoints = self.get_lookahead_value(speed)
-        # print("speed " + str(speed)
-        #       + " cur_ind " + str(self.current_waypoint_idx)
-        #       + " num_points " + str(num_waypoints)
-        #       + " index " + str((self.current_waypoint_idx + num_waypoints) % len(self.maneuverable_waypoints)) )
         return (self.current_waypoint_idx + num_waypoints) % len(
             self.maneuverable_waypoints
         )
-
-    # def get_lateral_pid_config(self):
-    #     """
-    #     Returns the PID values for the lateral (steering) PID
-    #     """
-    #     with open(
-    #         f"{os.path.dirname(__file__)}\\configs\\LatPIDConfig.json", "r"
-    #     ) as file:
-    #         config = json.load(file)
-    #     return config
 
     # The idea and code for averaging points is from smooth_waypoint_following_local_planner.py (Summer 2023)
     def next_waypoint_smooth(self, current_speed: float):

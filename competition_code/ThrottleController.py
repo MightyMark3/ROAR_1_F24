@@ -1,7 +1,6 @@
 import numpy as np
 import math
 from collections import deque
-from SpeedData import SpeedData
 import roar_py_interface
 
 
@@ -10,12 +9,62 @@ def distance_p_to_p(
 ):
     return np.linalg.norm(p2.location[:2] - p1.location[:2])
 
+class SpeedData:
+    def __init__(
+        self, distance_to_section, current_speed, current_section, current_ind, next_waypoint_ind, target_speed, recommended_speed
+    ):
+        self.radius = 0
+        self.radius_name = "r"
+        self.current_speed = current_speed
+        self.current_section = current_section
+        self.distance_to_section = distance_to_section
+        self.target_speed_at_distance = target_speed
+        self.target_speed_now_mu1 = 0
+        self.recommended_speed_now = recommended_speed
+        self.speed_diff = current_speed - recommended_speed
+        self.current_index = current_ind
+        self.next_waypoint_ind = next_waypoint_ind
+        self.distance_to_min_r = 0
+
+
+class DebugInfo:
+    def __init__(self, tick_counter, current_speed, current_location, current_section, current_ind):
+        self.tick = tick_counter
+        self.x = current_location[0]
+        self.y = current_location[1]
+        self.z = current_location[2]
+        self.current_speed = current_speed
+        self.current_section = current_section
+        self.current_ind = current_ind
+        self.throttle = 0
+        self.brake = 0
+        self.radius = 0
+        self.radius_name = "r"
+        self.distance_to_section = 0
+        self.target_speed_at_distance = 0
+        self.target_speed_now = 0
+        self.target_speed_now_mu1 = 0
+        # situation which produced this throttle/brake
+        self.s_name = "s"
+        self.distance_to_min_r = 1000
+
+    def copy_from_speed_data(self, speed_data, s_name):
+        self.radius = speed_data.radius
+        self.radius_name = speed_data.radius_name
+        self.distance_to_section = speed_data.distance_to_section
+        self.target_speed_at_distance = speed_data.target_speed_at_distance
+        self.target_speed_now = speed_data.recommended_speed_now
+        self.target_speed_now_mu1 = speed_data.target_speed_now_mu1
+        self.s_name = s_name
+        self.distance_to_min_r = speed_data.distance_to_min_r
+
 
 class ThrottleController:
     display_debug = False
     debug_strings = deque(maxlen=1000)
 
-    def __init__(self):
+    def __init__(self, waypoints):
+        self.waypoints = waypoints
         self.max_radius = 10000
         self.max_speed = 300
         self.intended_target_distance = [0, 30, 60, 90, 120, 140, 170]
@@ -26,120 +75,128 @@ class ThrottleController:
         self.tick_counter = 0
         self.previous_speed = 1.0
         self.brake_ticks = 0
+        self.brake_count = 0
 
         # for testing how fast the car stops
         self.brake_test_counter = 0
         self.brake_test_in_progress = False
 
+        self.test_speed = 184
+        self.prev_section = 0
+        self.radius_at_waypoint = self.precompute_radius()
+        self.indexes_with_low_r = self.find_low_radius()
+
+
     def __del__(self):
         print("done")
 
-    def run(
-        self, waypoints, current_location, current_speed, current_section
-    ) -> (float, float, int):
+    def run(self, current_location, current_speed, current_section, current_ind, next_waypoint_ind):
         self.tick_counter += 1
+        waypoints = (self.waypoints * 2)[next_waypoint_ind : next_waypoint_ind + 500]
+        debug_info = DebugInfo(self.tick_counter, current_speed, current_location, current_section, current_ind)
         throttle, brake = self.get_throttle_and_brake(
-            current_location, current_speed, current_section, waypoints
+            current_location, current_speed, current_section, waypoints, debug_info, current_ind, next_waypoint_ind
         )
-        # gear = max(1, (int)(math.log(current_speed + 0.00001, 5)))
         gear = max(1, int(current_speed / 60))
         if throttle < 0:
             gear = -1
 
-        # self.dprint("--- " + str(throttle) + " " + str(brake)
-        #             + " steer " + str(steering)
-        #             + "     loc x,z" + str(self.agent.vehicle.transform.location.x)
-        #             + " " + str(self.agent.vehicle.transform.location.z))
-
         self.previous_speed = current_speed
+
+        # if brake > 0:
+        #     self.brake_count += 1
+        #     if self.brake_count == 1: 
+        #         print(f"brake in section {current_section} {next_waypoint_ind} num_br_t {self.brake_ticks} sp {current_speed:.1f}")
+        # else:
+        #     if self.brake_count > 0:
+        #         print(f"brake in section {current_section} {next_waypoint_ind} finished {self.brake_count} sp {current_speed:.1f}")
+        #     self.brake_count = 0
+
         if self.brake_ticks > 0 and brake > 0:
             self.brake_ticks -= 1
 
-        # throttle = 0.05 * (100 - current_speed)
+        debug_info.throttle = throttle
+        debug_info.brake = brake
+        self.print_debug_info(debug_info, next_waypoint_ind)
         return throttle, brake, gear
+    
+    def print_debug_info(self, d, next_waypoint_ind):
+      if d.current_section in [9]:
+        print(f"p {d.tick:>4}, {d.current_speed: >6.2f}, " +
+              f"{d.target_speed_now: >6.2f}, " +
+              f"{d.throttle:.2f}, {d.brake:.2f}, " +
+              f"{d.distance_to_min_r:5.1f}, " +
+              f"{d.s_name:>3}, {d.x:7.2f}, {d.y:7.2f}, " +
+            #   f"{d.z:7.2f}, " +
+            #   f"{d.target_speed_now_mu1: >6.2f}, " +
+              f"{d.radius: >5.1f}, " +
+              f"{d.radius_name:>2}, " +
+            #   f"{d.distance_to_section:3.0f}, {d.target_speed_at_distance:.2f}, " +
+              f"{d.current_section}, {d.current_ind:>4}, {next_waypoint_ind:>4}")
+        self.distance_to_section = 0
+        self.target_speed_at_distance = 0
 
     def get_throttle_and_brake(
-        self, current_location, current_speed, current_section, waypoints
+        self, current_location, current_speed, current_section, waypoints, debug_info, current_ind, next_waypoint_ind
     ):
-        """
-        Returns throttle and brake values based off the car's current location and the radius of the approaching turn
-        """
-
         nextWaypoint = self.get_next_interesting_waypoints(current_location, waypoints)
-        r1 = self.get_radius(nextWaypoint[self.close_index : self.close_index + 3])
-        r2 = self.get_radius(nextWaypoint[self.mid_index : self.mid_index + 3])
-        r3 = self.get_radius(nextWaypoint[self.far_index : self.far_index + 3])
-
-        target_speed1 = self.get_target_speed(r1, current_section)
-        target_speed2 = self.get_target_speed(r2, current_section)
-        target_speed3 = self.get_target_speed(r3, current_section)
-
         close_distance = self.target_distance[self.close_index] + 3
         mid_distance = self.target_distance[self.mid_index]
         far_distance = self.target_distance[self.far_index]
+
+        sd1 = self.compute_speed_data("r1",
+            nextWaypoint[self.close_index : self.close_index + 3], close_distance, current_section, current_speed, current_ind, next_waypoint_ind)
+        sd2 = self.compute_speed_data("r2",
+            nextWaypoint[self.mid_index : self.mid_index + 3], mid_distance, current_section, current_speed, current_ind, next_waypoint_ind)
+        sd3 = self.compute_speed_data("r3",
+            nextWaypoint[self.far_index : self.far_index + 3], far_distance, current_section, current_speed, current_ind, next_waypoint_ind)
+
         speed_data = []
-        speed_data.append(
-            self.speed_for_turn(close_distance, target_speed1, current_speed)
-        )
-        speed_data.append(
-            self.speed_for_turn(mid_distance, target_speed2, current_speed)
-        )
-        speed_data.append(
-            self.speed_for_turn(far_distance, target_speed3, current_speed)
-        )
+        if not (sd1.radius < 80 and current_section == 6):
+            speed_data.append(sd1)
+        speed_data.append(sd2)
+        speed_data.append(sd3)
 
         if current_speed > 100:
             # at high speed use larger spacing between points to look further ahead and detect wide turns.
             if current_section != 9:
-                r4 = self.get_radius(
-                    [
-                        nextWaypoint[self.mid_index],
-                        nextWaypoint[self.mid_index + 2],
-                        nextWaypoint[self.mid_index + 4],
-                    ]
-                )
-                target_speed4 = self.get_target_speed(r4, current_section)
+                r4_waypoints = [
+                    nextWaypoint[self.mid_index],
+                    nextWaypoint[self.mid_index + 2],
+                    nextWaypoint[self.mid_index + 4],
+                ]
                 speed_data.append(
-                    self.speed_for_turn(close_distance, target_speed4, current_speed)
+                    self.compute_speed_data("r4", r4_waypoints, close_distance, current_section, current_speed, current_ind, next_waypoint_ind)
                 )
 
-            r5 = self.get_radius(
-                [
-                    nextWaypoint[self.close_index],
-                    nextWaypoint[self.close_index + 3],
-                    nextWaypoint[self.close_index + 6],
-                ]
-            )
-            target_speed5 = self.get_target_speed(r5, current_section)
+            r5_waypoints = [
+                nextWaypoint[self.close_index],
+                nextWaypoint[self.close_index + 3],
+                nextWaypoint[self.close_index + 6],
+            ]
             speed_data.append(
-                self.speed_for_turn(close_distance, target_speed5, current_speed)
+                self.compute_speed_data("r5", r5_waypoints, close_distance, current_section, current_speed, current_ind, next_waypoint_ind)
             )
 
         update = self.select_speed(speed_data)
+        update.distance_to_min_r = self.get_distance_to_point(current_location, current_ind)
 
-        self.print_speed(
-            " -- SPEED: ",
-            speed_data[0].recommended_speed_now,
-            speed_data[1].recommended_speed_now,
-            speed_data[2].recommended_speed_now,
-            (0 if len(speed_data) < 4 else speed_data[3].recommended_speed_now),
-            current_speed,
-        )
-
-        throttle, brake = self.speed_data_to_throttle_and_brake(update)
-        self.dprint("--- throt " + str(throttle) + " brake " + str(brake) + "---")
+        throttle, brake, s_name = self.speed_data_to_throttle_and_brake(update)
+        throttle = max(0, min(throttle, 1.0))
+        debug_info.copy_from_speed_data(update, s_name)
         return throttle, brake
+
+    def compute_speed_data(self, radius_name, waypoints, distance, current_section, current_speed, current_ind, next_waypoint_ind):
+        turn_radius = self.get_radius(waypoints, current_section)
+        return self.speed_for_turn_new(distance, turn_radius, radius_name, current_section, current_speed, current_ind, next_waypoint_ind)
 
     def speed_data_to_throttle_and_brake(self, speed_data: SpeedData):
         """
         Converts speed data into throttle and brake values
         """
-
-        # self.dprint("dist=" + str(round(speed_data.distance_to_section)) + " cs=" + str(round(speed_data.current_speed, 2))
-        #             + " ts= " + str(round(speed_data.target_speed_at_distance, 2))
-        #             + " maxs= " + str(round(speed_data.recommended_speed_now, 2)) + " pcnt= " + str(round(percent_of_max, 2)))
-
         percent_of_max = speed_data.current_speed / speed_data.recommended_speed_now
+        speed_excess = speed_data.current_speed - speed_data.recommended_speed_now
+        # speed_change_per_tick = 3.2  # Speed decrease in kph per tick
         speed_change_per_tick = 2.4  # Speed decrease in kph per tick
         percent_change_per_tick = 0.075  # speed drop for one time-tick of braking
         true_percent_change_per_tick = round(
@@ -153,128 +210,87 @@ class ThrottleController:
             self.previous_speed + 0.0001
         )  # avoid division by zero
         speed_change = round(speed_data.current_speed - self.previous_speed, 3)
+        speed_decrease = self.previous_speed - speed_data.current_speed
+
+        br_value = 1.0
+        br_value_low = 1.0
+        br_release_speed = 0
+        speed_excess_threshold = 0
+        if speed_data.current_section == 4:
+            br_value = 0.9
+            speed_excess_threshold = 15
+            br_value_low = br_value / 2
+            br_release_speed = 167  # 170-, 165+,  
+        if speed_data.current_section == 6:
+            br_value = 0.5
+            speed_excess_threshold = 20
+            br_value_low = br_value / 3
+            br_release_speed = 213 # 220-, 210+, 215+, 215-, 212+, 213+ 
+        if speed_data.current_section == 9:
+            br_value = 1.0
+            speed_excess_threshold = 30
+            br_value_low = br_value / 2
+            br_release_speed = 130 # 150-, 140-, 130+, 135-, 130+
 
         if percent_of_max > 1:
             # Consider slowing down
             if speed_data.current_speed > 200:  # Brake earlier at higher speeds
                 brake_threshold_multiplier = 0.9
+            
 
-            if percent_of_max > 1 + (
-                brake_threshold_multiplier * true_percent_change_per_tick
-            ):
+            if speed_data.current_speed < br_release_speed:
+                return 1, 0, "sbr"  # break release
+
+            if speed_data.current_section in [4, 6, 9] and speed_excess < speed_excess_threshold and speed_decrease > 2.0:
+                # reduce break
+                return 0, br_value_low, "slb"
+
+            if percent_of_max > 1 + (brake_threshold_multiplier * true_percent_change_per_tick):
                 if self.brake_ticks > 0:
-                    self.dprint(
-                        "tb: tick "
-                        + str(self.tick_counter)
-                        + " brake: counter "
-                        + str(self.brake_ticks)
-                    )
-                    return -1, 1
+                    return 0, br_value, "s1"
 
                 # if speed is not decreasing fast, hit the brake.
                 if self.brake_ticks <= 0 and speed_change < 1.5:
                     # start braking, and set for how many ticks to brake
-                    self.brake_ticks = (
-                        round(
-                            (
-                                speed_data.current_speed
-                                - speed_data.recommended_speed_now
-                            )
-                            / speed_change_per_tick
-                        )
-                        + 2
-                    )
-                    # self.brake_ticks = 1, or (1 or 2 but not more)
-                    self.dprint(
-                        "tb: tick "
-                        + str(self.tick_counter)
-                        + " brake: initiate counter "
-                        + str(self.brake_ticks)
-                    )
-                    return -1, 1
+                    self.brake_ticks = \
+                        round((speed_data.current_speed - speed_data.recommended_speed_now) / speed_change_per_tick) + 2
+                    return 0, 1, "s2"
 
                 else:
                     # speed is already dropping fast, ok to throttle because the effect of throttle is delayed
-                    self.dprint(
-                        "tb: tick "
-                        + str(self.tick_counter)
-                        + " brake: throttle early1: sp_ch="
-                        + str(percent_speed_change)
-                    )
                     self.brake_ticks = 0  # done slowing down. clear brake_ticks
-                    return 1, 0
+                    return 1, 0, "s3"
             else:
                 if speed_change >= 1.5:
                     # speed is already dropping fast, ok to throttle because the effect of throttle is delayed
-                    self.dprint(
-                        "tb: tick "
-                        + str(self.tick_counter)
-                        + " brake: throttle early2: sp_ch="
-                        + str(percent_speed_change)
-                    )
                     self.brake_ticks = 0  # done slowing down. clear brake_ticks
-                    return 1, 0
+                    return 1, 0, "s4"
 
                 # TODO: Try to get rid of coasting. Unnecessary idle time that could be spent speeding up or slowing down
-                throttle_to_maintain = self.get_throttle_to_maintain_speed(
-                    speed_data.current_speed
-                )
+                throttle_to_maintain = self.get_throttle_to_maintain_speed(speed_data.current_speed)
 
                 if percent_of_max > 1.02 or percent_speed_change > (
                     -true_percent_change_per_tick / 2
                 ):
-                    self.dprint(
-                        "tb: tick "
-                        + str(self.tick_counter)
-                        + " brake: throttle down: sp_ch="
-                        + str(percent_speed_change)
-                    )
                     return (
                         throttle_to_maintain * throttle_decrease_multiple,
-                        0,
+                        0, "s5"
                     )  # coast, to slow down
                 else:
-                    # self.dprint("tb: tick " + str(self.tick_counter) + " brake: throttle maintain: sp_ch=" + str(percent_speed_change))
-                    return throttle_to_maintain, 0
+                    return throttle_to_maintain, 0, "s6"
         else:
             self.brake_ticks = 0  # done slowing down. clear brake_ticks
             # Speed up
             if speed_change >= 1.5:
                 # speed is dropping fast, ok to throttle because the effect of throttle is delayed
-                self.dprint(
-                    "tb: tick "
-                    + str(self.tick_counter)
-                    + " throttle: full speed drop: sp_ch="
-                    + str(percent_speed_change)
-                )
-                return 1, 0
+                return 1, 0, "s7"
             if percent_of_max < speed_up_threshold:
-                self.dprint(
-                    "tb: tick "
-                    + str(self.tick_counter)
-                    + " throttle full: p_max="
-                    + str(percent_of_max)
-                )
-                return 1, 0
-            throttle_to_maintain = self.get_throttle_to_maintain_speed(
-                speed_data.current_speed
-            )
+                return 1, 0, "s8"
+            throttle_to_maintain = self.get_throttle_to_maintain_speed(speed_data.current_speed)
             if percent_of_max < 0.98 or true_percent_change_per_tick < -0.01:
-                self.dprint(
-                    "tb: tick "
-                    + str(self.tick_counter)
-                    + " throttle up: sp_ch="
-                    + str(percent_speed_change)
-                )
-                return throttle_to_maintain * throttle_increase_multiple, 0
+                return throttle_to_maintain * throttle_increase_multiple, 0, "s9"
             else:
-                self.dprint(
-                    "tb: tick "
-                    + str(self.tick_counter)
-                    + " throttle maintain: sp_ch="
-                    + str(percent_speed_change)
-                )
-                return throttle_to_maintain, 0
+                return throttle_to_maintain, 0, "s10"
 
     # used to detect when speed is dropping due to brakes applied earlier. speed delta has a steep negative slope.
     def isSpeedDroppingFast(self, percent_change_per_tick: float, current_speed):
@@ -311,8 +327,8 @@ class ThrottleController:
         throttle = 0.75 + current_speed / 500
         return throttle
 
-    def speed_for_turn(
-        self, distance: float, target_speed: float, current_speed: float
+    def speed_for_turn_new(
+        self, distance: float, radius: float, radius_name: str, current_section: int, current_speed: float, current_ind, next_waypoint_ind
     ):
         """Generates a SpeedData object with the target speed for the far
 
@@ -325,10 +341,21 @@ class ThrottleController:
             SpeedData: A SpeedData object containing the distance to the corner, current speed, target speed, and max speed
         """
         # Takes in a target speed and distance and produces a speed that the car should target. Returns a SpeedData object
+        target_speed = self.get_target_speed(radius, current_section)
+        max_speed = self.get_max_speed(target_speed, distance)
 
+        target_speed_mu1 = self.get_target_speed(radius, current_section, 1.0)
+        max_speed_mu1 = self.get_max_speed(target_speed_mu1, distance)
+
+        speed_data = SpeedData(distance, current_speed, current_section, current_ind, next_waypoint_ind, target_speed, max_speed)
+        speed_data.radius = radius
+        speed_data.radius_name = radius_name
+        speed_data.target_speed_now_mu1 = max_speed_mu1
+        return speed_data
+    
+    def get_max_speed(self, target_speed, distance):
         d = (1 / 675) * (target_speed**2) + distance
-        max_speed = math.sqrt(825 * d)
-        return SpeedData(distance, current_speed, target_speed, max_speed)
+        return math.sqrt(825 * d)
 
     def get_next_interesting_waypoints(self, current_location, more_waypoints):
         """Returns a list of waypoints that are approximately as far as specified in intended_target_distance from the current location
@@ -356,10 +383,7 @@ class ThrottleController:
         for p in more_waypoints:
             end = p
             num_points += 1
-            # print("start " + str(start) + "\n- - - - -\n")
-            # print("end " + str(end) +     "\n- - - - -\n")
             curr_dist += distance_p_to_p(start, end)
-            # curr_dist += start.location.distance(end.location)
             if curr_dist > self.intended_target_distance[len(points)]:
                 self.target_distance[len(points)] = curr_dist
                 points.append(end)
@@ -368,10 +392,9 @@ class ThrottleController:
             if len(points) >= len(self.target_distance):
                 break
 
-        self.dprint("wp dist " + str(dist))
         return points
 
-    def get_radius(self, wp: [roar_py_interface.RoarPyWaypoint]):
+    def get_radius(self, wp: [roar_py_interface.RoarPyWaypoint], current_section=None):
         """Returns the radius of a curve given 3 waypoints using the Menger Curvature Formula
 
         Args:
@@ -408,7 +431,24 @@ class ThrottleController:
 
         return radius
 
-    def get_target_speed(self, radius: float, current_section: int):
+    def mu_for_section(self, current_section: int):
+        mu = 2.4
+        if current_section == 2:
+            mu = 3.16
+        if current_section == 3:
+            mu = 3.15
+            # mu = 3.0  # worked
+        if current_section == 4:
+            # mu = 2.4 # old
+            mu = 2.4
+        if current_section == 6:
+            # mu = 3.1  # old
+            mu = 3.3
+        if current_section == 9:
+            mu = 2.2  # old
+        return mu
+
+    def get_target_speed(self, radius: float, current_section: int, mu=None):
         """Returns a target speed based on the radius of the turn and the section it is in
 
         Args:
@@ -418,52 +458,62 @@ class ThrottleController:
         Returns:
             float: The maximum speed the car can go around the corner at
         """
-
-        mu = 2.4
-
         if radius >= self.max_radius:
             return self.max_speed
 
-        if current_section == 2:
-            mu = 3.15
-        if current_section == 3:
-            mu = 3.15
-        if current_section == 6:
-            mu = 3.1
-        if current_section == 9:
-            mu = 2.2
-
+        if mu is None:
+            mu = self.mu_for_section(current_section)
         target_speed = math.sqrt(mu * 9.81 * radius) * 3.6
 
-        return max(
-            20, min(target_speed, self.max_speed)
-        )  # clamp between 20 and max_speed
+        return max(20, min(target_speed, self.max_speed))  # clamp between 20 and max_speed
 
-    def print_speed(
-        self, text: str, s1: float, s2: float, s3: float, s4: float, curr_s: float
-    ):
-        """
-        Prints debug speed values
-        """
-        self.dprint(
-            text
-            + " s1= "
-            + str(round(s1, 2))
-            + " s2= "
-            + str(round(s2, 2))
-            + " s3= "
-            + str(round(s3, 2))
-            + " s4= "
-            + str(round(s4, 2))
-            + " cspeed= "
-            + str(round(curr_s, 2))
-        )
+    def get_ind_of_next_min_radius(self, current_ind):
+        """returns ind that could exceed len, need to apply modulo."""
+        for i in range(current_ind, len(self.waypoints) * 2):
+            ind = i % len(self.waypoints)
+            if ind in self.indexes_with_low_r:
+                return i
+        return -1
+    
+    def get_distance_to_point(self, current_location, current_ind):
+        ind_of_next_min_r = self.get_ind_of_next_min_radius(current_ind)
+        if ind_of_next_min_r == -1:
+            return 300
 
-    # debug print
-    def dprint(self, text):
-        """
-        Prints debug text
-        """
-        if self.display_debug:
-            print(text)
-            self.debug_strings.append(text)
+        min_location = self.waypoints[ ind_of_next_min_r % len(self.waypoints) ].location[:2]
+        return np.linalg.norm(min_location - current_location[:2])
+
+    def precompute_radius(self):
+        # for each waypoint compute turn radius using 3 points
+        #   (point which is 10 points before this point), 
+        #   (this point), 
+        #   (point which is 10 points after this points)
+        dist = 10
+        r_list = [self.max_radius] * len(self.waypoints)
+        for i in range(0, len(self.waypoints)):
+            s = (i - dist) % (len(self.waypoints))
+            e = (i + dist) % (len(self.waypoints))
+            radius = self.get_radius([self.waypoints[s], self.waypoints[i], self.waypoints[e]])
+            r_list[i] = radius
+        return r_list
+    
+    def min_index(self, start, end):
+        min_r = 10000
+        min_ind = 0
+        for i in range(start, end+1):
+            if self.radius_at_waypoint[i] < min_r:
+                min_r = self.radius_at_waypoint[i]
+                min_ind = i
+        return min_ind
+    
+    def find_low_radius(self):
+        dist = 10
+        ind_list = []
+        for i in range(0, len(self.waypoints)):
+            s = (i - dist) % (len(self.waypoints))
+            e = (i + dist) % (len(self.waypoints))
+            # print(i, s, e, self.min_index(s, e))
+            if self.radius_at_waypoint[i] < 90 \
+                and self.min_index(s, e) == i:
+                ind_list.append(i)
+        return ind_list
